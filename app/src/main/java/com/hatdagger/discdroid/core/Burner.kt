@@ -1,0 +1,419 @@
+package com.hatdagger.discdroid.core
+
+import java.io.Closeable
+import java.io.IOException
+import java.io.InputStream
+import java.util.zip.CRC32
+
+/** What kind of writing a disc needs. */
+enum class MediaKind(val label: String) {
+    CD_R("CD-R"), CD_RW("CD-RW"),
+    DVD_MINUS("DVD-R/-RW"),      // sequential, incremental recording
+    DVD_PLUS_R("DVD+R"),
+    OVERWRITE("rewritable (overwrite)"), // DVD+RW, DVD-RW restricted overwrite, DVD-RAM
+    UNSUPPORTED("not writable");
+
+    val isCd get() = this == CD_R || this == CD_RW
+    val canSimulate get() = this == CD_R || this == CD_RW || this == DVD_MINUS
+
+    companion object {
+        fun of(profile: Int) = when (profile) {
+            0x09 -> CD_R
+            0x0A -> CD_RW
+            0x11, 0x14, 0x15, 0x16 -> DVD_MINUS
+            0x1B, 0x2B -> DVD_PLUS_R
+            0x12, 0x13, 0x1A, 0x2A -> OVERWRITE
+            else -> UNSUPPORTED
+        }
+    }
+}
+
+data class DiscStatus(
+    val profile: Int,
+    /** 0 = blank, 1 = appendable, 2 = complete/finalized, 3 = other */
+    val state: Int,
+    val erasable: Boolean,
+    val nextWritable: Long,
+    val freeSectors: Long,
+    val trackNumber: Int,
+) {
+    val kind get() = MediaKind.of(profile)
+    val isBlank get() = state == 0
+    fun describe(): String {
+        val st = when (state) { 0 -> "blank"; 1 -> "partly written"; 2 -> "finalized (full)"; else -> "unusual state" }
+        val mb = freeSectors * 2048 / 1_048_576
+        return "${Profiles.name(profile)}, $st, about $mb MB free"
+    }
+}
+
+/** 16-bit stereo 44.1 kHz little-endian PCM for one audio track. */
+interface PcmSource : Closeable {
+    val name: String
+    val totalBytes: Long
+    /** Reads up to [len] bytes; returns -1 at end. */
+    fun read(buf: ByteArray, off: Int, len: Int): Int
+}
+
+class BurnOptions(val simulate: Boolean, val verify: Boolean)
+
+/**
+ * Writes discs with MMC commands: data (ISO images) to CD-R/RW and DVD±R/RW,
+ * and audio CDs (track-at-once, 2-second gaps) to CD-R/RW.
+ */
+class Burner(private val drive: Drive, private val listener: RipListener, private val isCancelled: () -> Boolean) {
+
+    // ------------------------------------------------------------------ disc state
+
+    fun discStatus(): DiscStatus {
+        val profile = drive.currentProfile()
+        val di = ByteArray(34)
+        drive.run("READ DISC INFORMATION", byteArrayOf(0x51, 0, 0, 0, 0, 0, 0, 0, 34, 0), Direction.IN, di, 34)
+        val state = di.u8(2) and 0x03
+        val erasable = (di.u8(2) and 0x10) != 0
+        val lastTrackInLastSession = di.u8(6) or (di.u8(11) shl 8)
+        val ti = ByteArray(36)
+        val cdb = ByteArray(10)
+        cdb[0] = 0x52; cdb[1] = 0x01
+        cdb.putBe32(2, lastTrackInLastSession.toLong())
+        cdb[8] = 36
+        drive.run("READ TRACK INFORMATION", cdb, Direction.IN, ti, 36)
+        val nwaValid = (ti.u8(7) and 0x01) != 0
+        return DiscStatus(
+            profile, state, erasable,
+            if (nwaValid) ti.be32(12) else 0L,
+            ti.be32(16),
+            ti.u8(2) or (ti.u8(32) shl 8),
+        )
+    }
+
+    // ------------------------------------------------------------------ low-level commands
+
+    /** Read-modify-write of the Write Parameters mode page (0x05). */
+    fun setWriteParameters(writeType: Int, trackMode: Int, dataBlockType: Int, simulate: Boolean, linkSize: Int = 0) {
+        val buf = ByteArray(128)
+        val sense = byteArrayOf(0x5A, 0, 0x05, 0, 0, 0, 0, 0, 128.toByte(), 0)
+        val n = drive.run("MODE SENSE (write parameters)", sense, Direction.IN, buf, buf.size)
+        val bdl = buf.be16(6)
+        val p = 8 + bdl
+        if (n < p + 16 || (buf.u8(p) and 0x3F) != 0x05) throw IOException("Drive returned no write-parameters page")
+        val pageLen = buf.u8(p + 1) + 2
+        buf[0] = 0; buf[1] = 0                 // mode data length is reserved in MODE SELECT
+        buf[p] = (buf.u8(p) and 0x3F).toByte() // clear PS bit
+        var b2 = 0x40 or (writeType and 0x0F)  // BUFE (underrun protection) on
+        if (simulate) b2 = b2 or 0x10
+        if (linkSize > 0) b2 = b2 or 0x20      // LS_V
+        buf[p + 2] = b2.toByte()
+        buf[p + 3] = (trackMode and 0x0F).toByte() // multisession 0 = finalize, no copy, no FP
+        buf[p + 4] = (dataBlockType and 0x0F).toByte()
+        buf[p + 5] = linkSize.toByte()
+        buf[p + 8] = 0                          // session format: CD-DA / CD-ROM
+        buf.putBe32(p + 10, 0)                  // packet size
+        buf[p + 14] = 0; buf[p + 15] = 150.toByte() // audio pause length (2 s)
+        val total = p + pageLen
+        val select = byteArrayOf(0x55, 0x10, 0, 0, 0, 0, 0, (total shr 8).toByte(), total.toByte(), 0)
+        drive.run("MODE SELECT (write parameters)", select, Direction.OUT, buf, total)
+    }
+
+    private fun isBusy(s: Sense) = s.key == 0x02 && s.asc == 0x04 // becoming ready / format / long write in progress
+
+    /** Polls TEST UNIT READY until the drive finishes a background operation. */
+    fun waitIdle(what: String, maxMs: Long = 20 * 60_000L) {
+        val deadline = System.currentTimeMillis() + maxMs
+        while (true) {
+            try { drive.testUnitReady(); return } catch (e: ScsiException) {
+                if (!isBusy(e.sense) && !e.sense.isMediumChanged && !e.sense.isReset) throw e
+            }
+            if (System.currentTimeMillis() > deadline) throw IOException("$what took too long")
+            Thread.sleep(500)
+        }
+    }
+
+    fun write(lba: Long, sectors: Int, sectorSize: Int, buf: ByteArray) {
+        val cdb = ByteArray(10)
+        cdb[0] = 0x2A
+        cdb.putBe32(2, lba)
+        cdb[7] = (sectors shr 8).toByte(); cdb[8] = sectors.toByte()
+        val deadline = System.currentTimeMillis() + 120_000
+        while (true) {
+            try {
+                drive.run("WRITE", cdb, Direction.OUT, buf, sectors * sectorSize, 60_000); return
+            } catch (e: ScsiException) {
+                // Drive buffer full / still calibrating: wait and resend the same block.
+                if (isBusy(e.sense) && System.currentTimeMillis() < deadline) { Thread.sleep(20); continue }
+                throw IOException(
+                    "Write failed at sector $lba: ${e.sense.describe()}. " +
+                        if (e.sense.key == 0x03) "The disc is probably ruined." else "",
+                )
+            }
+        }
+    }
+
+    fun synchronizeCache() {
+        drive.run("SYNCHRONIZE CACHE", ByteArray(10).also { it[0] = 0x35 }, Direction.NONE, ByteArray(0), 0, 600_000)
+    }
+
+    /** function: 1 = close track, 2 = close session (finalizes when multisession = 0), 6 = finalize DVD+R. */
+    fun closeTrackSession(function: Int, track: Int) {
+        val cdb = byteArrayOf(0x5B, 0x01, function.toByte(), 0, (track shr 8).toByte(), track.toByte(), 0, 0, 0, 0)
+        drive.run("CLOSE TRACK/SESSION", cdb, Direction.NONE, ByteArray(0), 0, 60_000)
+        waitIdle("Closing the disc")
+    }
+
+    /** Quick-erase a CD-RW or DVD-RW, or format a blank DVD+RW. */
+    fun erase(status: DiscStatus) {
+        when (status.profile) {
+            0x1A, 0x2A -> formatPlusRw()
+            0x0A, 0x13, 0x14 -> {
+                listener.log("Erasing (quick)… this can take a few minutes.")
+                drive.run("BLANK", byteArrayOf(0xA1.toByte(), 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), Direction.NONE, ByteArray(0), 0, 60_000)
+                waitIdle("Erasing")
+            }
+            else -> throw IOException("${Profiles.name(status.profile)} discs can't be erased.")
+        }
+    }
+
+    private fun formatPlusRw() {
+        listener.log("Formatting DVD+RW…")
+        val params = byteArrayOf(0, 0x02, 0, 8, 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), (0x26 shl 2).toByte(), 0, 0, 0)
+        drive.run("FORMAT UNIT", byteArrayOf(0x04, 0x11, 0, 0, 0, 0), Direction.OUT, params, params.size, 60_000)
+        waitIdle("Formatting")
+    }
+
+    // ------------------------------------------------------------------ data (ISO) burning
+
+    class BurnResult(val startLba: Long, val sectors: Long, val crc32: Long)
+
+    fun burnData(source: InputStream, sizeBytes: Long, opts: BurnOptions): BurnResult {
+        drive.waitReady(isCancelled = isCancelled) || throw IOException("No disc in the drive.")
+        var st = discStatus()
+        val kind = st.kind
+        listener.log("Disc: ${st.describe()}")
+        if (kind == MediaKind.UNSUPPORTED) throw IOException("This disc (${Profiles.name(st.profile)}) can't be written by DiscDroid.")
+        if (opts.simulate && !kind.canSimulate) throw IOException("Test burns aren't possible on ${kind.label} discs. Untick \"Test burn\".")
+        if (kind == MediaKind.OVERWRITE && st.profile == 0x1A && st.isBlank) { formatPlusRw(); st = discStatus() }
+        if (kind != MediaKind.OVERWRITE && !st.isBlank) {
+            throw IOException(if (st.erasable) "The disc isn't blank. Tap Erase first." else "The disc isn't blank. Use a new disc.")
+        }
+
+        val sectors = (sizeBytes + Drive.DATA_SECTOR - 1) / Drive.DATA_SECTOR
+        val start = if (kind == MediaKind.OVERWRITE) 0L else st.nextWritable
+        val free = if (kind == MediaKind.OVERWRITE) drive.readCapacity().first + 1 else st.freeSectors
+        if (sectors > free) throw IOException("Image needs %,d sectors but the disc has %,d free.".format(sectors, free))
+
+        when (kind) {
+            MediaKind.CD_R, MediaKind.CD_RW -> setWriteParameters(1, 4, 8, opts.simulate)   // TAO, data, Mode 1
+            MediaKind.DVD_MINUS -> setWriteParameters(0, 5, 8, opts.simulate, linkSize = 16) // incremental
+            else -> {}
+        }
+        listener.log((if (opts.simulate) "TEST burn (laser off): " else "Burning: ") + "%,d sectors…".format(sectors))
+
+        val crc = CRC32()
+        val buf = ByteArray(DATA_CHUNK * Drive.DATA_SECTOR)
+        var done = 0L
+        while (done < sectors) {
+            if (isCancelled()) throw CancelledException()
+            val n = minOf(DATA_CHUNK.toLong(), sectors - done).toInt()
+            val bytes = n * Drive.DATA_SECTOR
+            readFully(source, buf, bytes)
+            crc.update(buf, 0, bytes)
+            write(start + done, n, Drive.DATA_SECTOR, buf)
+            done += n
+            listener.progress("Burning", done, sectors)
+        }
+        finish(kind, st.trackNumber, opts.simulate)
+        return BurnResult(start, sectors, crc.value)
+    }
+
+    /** Reads exactly [len] bytes, padding with zeros at end of stream. */
+    private fun readFully(src: InputStream, buf: ByteArray, len: Int) {
+        var got = 0
+        while (got < len) {
+            val n = src.read(buf, got, len - got)
+            if (n < 0) { buf.fill(0, got, len); return }
+            got += n
+        }
+    }
+
+    private fun finish(kind: MediaKind, track: Int, simulate: Boolean) {
+        listener.log("Flushing drive buffer…")
+        synchronizeCache()
+        waitIdle("Writing")
+        if (simulate) { listener.log("Test burn finished — nothing was written to the disc."); return }
+        listener.log("Finalizing disc…")
+        when (kind) {
+            MediaKind.CD_R, MediaKind.CD_RW, MediaKind.DVD_MINUS -> {
+                closeTrackSession(1, track)
+                closeTrackSession(2, 0)
+            }
+            MediaKind.DVD_PLUS_R -> {
+                closeTrackSession(1, track)
+                try { closeTrackSession(6, 0) } catch (e: ScsiException) { closeTrackSession(2, 0) }
+            }
+            MediaKind.OVERWRITE -> try { closeTrackSession(2, 0) } catch (_: ScsiException) {}
+            MediaKind.UNSUPPORTED -> {}
+        }
+        listener.log("Disc finalized.")
+    }
+
+    /** Reads the burned data back and compares its CRC32. */
+    fun verifyData(result: BurnResult): Boolean {
+        drive.waitReady(isCancelled = isCancelled)
+        val crc = CRC32()
+        val buf = ByteArray(DATA_CHUNK * Drive.DATA_SECTOR)
+        var done = 0L
+        while (done < result.sectors) {
+            if (isCancelled()) throw CancelledException()
+            val n = minOf(DATA_CHUNK.toLong(), result.sectors - done).toInt()
+            drive.readData(result.startLba + done, n, buf)
+            crc.update(buf, 0, n * Drive.DATA_SECTOR)
+            done += n
+            listener.progress("Verifying", done, result.sectors)
+        }
+        return crc.value == result.crc32
+    }
+
+    // ------------------------------------------------------------------ audio CD burning
+
+    fun burnAudio(tracks: List<PcmSource>, opts: BurnOptions) {
+        require(tracks.isNotEmpty() && tracks.size <= 99) { "An audio CD holds 1 to 99 tracks." }
+        drive.waitReady(isCancelled = isCancelled) || throw IOException("No disc in the drive.")
+        val st0 = discStatus()
+        listener.log("Disc: ${st0.describe()}")
+        if (!st0.kind.isCd) throw IOException("Audio CDs need a CD-R or CD-RW (this is ${Profiles.name(st0.profile)}).")
+        if (!st0.isBlank) throw IOException(if (st0.erasable) "The disc isn't blank. Tap Erase first." else "The disc isn't blank. Use a new CD-R.")
+
+        val sectorsPer = tracks.map { maxOf(MIN_TRACK_SECTORS, (it.totalBytes + Drive.AUDIO_SECTOR - 1) / Drive.AUDIO_SECTOR) }
+        val needed = sectorsPer.sum() + tracks.size * TAO_OVERHEAD
+        if (needed > st0.freeSectors) {
+            throw IOException("These tracks need about %d:%02d but the disc holds %d:%02d.".format(
+                needed / 75 / 60, needed / 75 % 60, st0.freeSectors / 75 / 60, st0.freeSectors / 75 % 60))
+        }
+        setWriteParameters(1, 0, 0, opts.simulate) // TAO, audio, raw 2352
+        listener.log((if (opts.simulate) "TEST burn (laser off) of " else "Burning ") + "${tracks.size} tracks…")
+
+        val buf = ByteArray(AUDIO_CHUNK * Drive.AUDIO_SECTOR)
+        for ((i, src) in tracks.withIndex()) {
+            val st = if (i == 0) st0 else discStatus()
+            val total = sectorsPer[i]
+            var done = 0L
+            val label = "Track ${i + 1}/${tracks.size}"
+            listener.log("$label: ${src.name}")
+            while (done < total) {
+                if (isCancelled()) throw CancelledException()
+                val n = minOf(AUDIO_CHUNK.toLong(), total - done).toInt()
+                val bytes = n * Drive.AUDIO_SECTOR
+                var got = 0
+                while (got < bytes) {
+                    val r = src.read(buf, got, bytes - got)
+                    if (r < 0) { buf.fill(0, got, bytes); break }
+                    got += r
+                }
+                write(st.nextWritable + done, n, Drive.AUDIO_SECTOR, buf)
+                done += n
+                listener.progress(label, done, total)
+            }
+            synchronizeCache()
+            waitIdle("Writing")
+            try { closeTrackSession(1, st.trackNumber) } catch (e: ScsiException) { if (!opts.simulate) throw e }
+        }
+        if (opts.simulate) { listener.log("Test burn finished — nothing was written to the disc."); return }
+        listener.log("Finalizing disc…")
+        closeTrackSession(2, 0)
+        listener.log("Disc finalized.")
+    }
+
+    companion object {
+        const val DATA_CHUNK = 32
+        const val AUDIO_CHUNK = 26
+        const val MIN_TRACK_SECTORS = 300L // 4 seconds, the Red Book minimum
+        const val TAO_OVERHEAD = 152L      // pregap + run-in/out per track, roughly
+    }
+}
+
+/** Reads a 16-bit PCM WAV file (44.1 kHz, mono or stereo) as CD audio. */
+class WavSource(override val name: String, private val input: InputStream) : PcmSource {
+    override val totalBytes: Long
+    private val mono: Boolean
+    private var remaining: Long
+    private var monoBuf = ByteArray(0)
+
+    init {
+        val hdr = ByteArray(12)
+        readExact(hdr, 12)
+        if (String(hdr, 0, 4) != "RIFF" || String(hdr, 8, 4) != "WAVE") throw IOException("$name is not a WAV file")
+        var channels = 0
+        var rate = 0L
+        var bits = 0
+        var format = 0
+        var dataLen = -1L
+        val ch = ByteArray(8)
+        while (dataLen < 0) {
+            readExact(ch, 8)
+            val id = String(ch, 0, 4)
+            val len = ch.le32(4)
+            if (id == "fmt ") {
+                val f = ByteArray(len.toInt())
+                readExact(f, f.size)
+                format = f.u8(0) or (f.u8(1) shl 8)
+                channels = f.u8(2) or (f.u8(3) shl 8)
+                rate = f.le32(4)
+                bits = f.u8(14) or (f.u8(15) shl 8)
+                if (format == 0xFFFE && f.size >= 26) format = f.u8(24) or (f.u8(25) shl 8) // WAVE_FORMAT_EXTENSIBLE
+                if (len % 2 == 1L) skip(1)
+            } else if (id == "data") {
+                dataLen = len
+            } else {
+                skip(len + (len and 1))
+            }
+        }
+        if (format != 1 || bits != 16 || rate != 44_100L || channels !in 1..2) {
+            throw IOException("$name must be 16-bit 44.1 kHz PCM (it is $bits-bit ${rate} Hz, $channels ch)")
+        }
+        mono = channels == 1
+        remaining = dataLen
+        totalBytes = if (mono) dataLen * 2 else dataLen
+    }
+
+    private fun readExact(b: ByteArray, n: Int) {
+        var got = 0
+        while (got < n) {
+            val r = input.read(b, got, n - got)
+            if (r < 0) throw IOException("$name is truncated")
+            got += r
+        }
+    }
+
+    private fun skip(n: Long) {
+        var left = n
+        val tmp = ByteArray(4096)
+        while (left > 0) {
+            val r = input.read(tmp, 0, minOf(left, tmp.size.toLong()).toInt())
+            if (r < 0) throw IOException("$name is truncated")
+            left -= r
+        }
+    }
+
+    override fun read(buf: ByteArray, off: Int, len: Int): Int {
+        if (remaining <= 0) return -1
+        if (!mono) {
+            val r = input.read(buf, off, minOf(len.toLong(), remaining).toInt())
+            if (r < 0) { remaining = 0; return -1 }
+            remaining -= r
+            return r
+        }
+        // Mono: read len/4 samples and duplicate to both channels.
+        val samples = minOf((len / 4).toLong(), remaining / 2).toInt()
+        if (samples == 0) { remaining = 0; return -1 }
+        if (monoBuf.size < samples * 2) monoBuf = ByteArray(samples * 2)
+        readExact(monoBuf, samples * 2)
+        remaining -= samples * 2
+        for (i in 0 until samples) {
+            val lo = monoBuf[i * 2]; val hi = monoBuf[i * 2 + 1]
+            buf[off + i * 4] = lo; buf[off + i * 4 + 1] = hi
+            buf[off + i * 4 + 2] = lo; buf[off + i * 4 + 3] = hi
+        }
+        return samples * 4
+    }
+
+    override fun close() = input.close()
+}

@@ -11,7 +11,7 @@ class Drive(private val transport: ScsiTransport) : AutoCloseable {
 
     val description get() = transport.description
 
-    private fun run(
+    internal fun run(
         name: String, cdb: ByteArray, dir: Direction, buf: ByteArray, len: Int, timeoutMs: Int = 20_000,
     ): Int {
         val r = transport.execute(cdb, dir, buf, len, timeoutMs)

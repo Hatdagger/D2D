@@ -2,6 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-feature android:name="android.hardware.usb.host" android:required="true" />
+    <!-- Only used to look up album/track names and cover art on MusicBrainz. -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:label="DiscDroid"

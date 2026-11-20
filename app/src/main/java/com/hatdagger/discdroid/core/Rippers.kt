@@ -4,6 +4,10 @@ import java.io.IOException
 import java.io.OutputStream
 import java.util.zip.CRC32
 
+enum class AudioFormat(val extension: String, val mime: String) {
+    WAV("wav", "audio/x-wav"), FLAC("flac", "audio/flac")
+}
+
 interface RipListener {
     fun log(message: String)
     /** [done] and [total] are in sectors for the current item. */
@@ -103,12 +107,16 @@ private class ChunkReader(
 
 class AudioRipper(private val drive: Drive, private val listener: RipListener, private val isCancelled: () -> Boolean) {
 
-    /** Writes one track as a complete WAV file to [out]. Does not close [out]. */
-    fun ripTrack(track: Track, label: String, out: OutputStream): RipStats {
+    /** Writes one track as a complete WAV or FLAC file to [out]. Does not close [out]. */
+    fun ripTrack(
+        track: Track, label: String, out: OutputStream,
+        format: AudioFormat = AudioFormat.WAV, tags: List<Pair<String, String>> = emptyList(),
+    ): RipStats {
         require(track.isAudio) { "Track ${track.number} is a data track" }
         val total = track.lengthSectors
         val start = System.currentTimeMillis()
-        out.write(Wav.header(total * Drive.AUDIO_SECTOR))
+        val flac = if (format == AudioFormat.FLAC) FlacEncoder(out, total * SAMPLES_PER_SECTOR, tags) else null
+        if (flac == null) out.write(Wav.header(total * Drive.AUDIO_SECTOR))
         val reader = ChunkReader(Drive.AUDIO_SECTOR, CHUNK, 3, listener, isCancelled) { lba, n, b -> drive.readAudio(lba, n, b) }
         val crc = CRC32()
         var done = 0L
@@ -116,16 +124,18 @@ class AudioRipper(private val drive: Drive, private val listener: RipListener, p
             val n = minOf(CHUNK.toLong(), total - done).toInt()
             reader.readChunk(track.startLba + done, n)
             val bytes = n * Drive.AUDIO_SECTOR
-            out.write(reader.buf, 0, bytes)
+            if (flac != null) flac.write(reader.buf, 0, bytes) else out.write(reader.buf, 0, bytes)
             crc.update(reader.buf, 0, bytes)
             done += n
             listener.progress(label, done, total)
         }
+        flac?.finish()
         out.flush()
         return RipStats(total, reader.bad, reader.retried, crc.value, System.currentTimeMillis() - start)
     }
 
     companion object {
+        const val SAMPLES_PER_SECTOR = 588
         const val CHUNK = 26 // 26 * 2352 = 61,152 bytes per command
     }
 }

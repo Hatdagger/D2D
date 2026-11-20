@@ -6,18 +6,25 @@ DiscDroid talks to the drive directly over USB with the same low-level commands 
 (SCSI/MMC over USB Mass Storage Bulk-Only Transport), so it works even though Android has no
 built-in support for optical drives.
 
-## What works now (v0.1)
+## What works now (v0.2)
 
-| Feature | Status |
-|---|---|
-| Detect the disc drive (skips card readers/hubs in combo drives) | ✅ |
-| Read track list, disc type and CD-TEXT (album/track names) | ✅ |
-| Rip audio CDs to WAV, one file per track, with retries and a rip log | ✅ |
-| Copy data CDs/DVDs to an ISO image | ✅ |
-| Eject | ✅ |
-| FLAC output, online track names (MusicBrainz), AccurateRip check | Planned |
-| Burn ISO to CD-R/RW, DVD±R/RW | Planned |
-| Burn audio CDs from WAV/FLAC | Planned |
+The screen is split like a Nintendo DS: **RIP** on top (blue), **BURN** on the bottom (red),
+with the progress bar and Cancel button in the "hinge" between them.
+
+**Ripping**
+- Detects the disc drive (skips card readers/hubs in combo drives)
+- Reads the track list, disc type, and album/track names (MusicBrainz online, or CD-TEXT)
+- Rips audio CDs to **FLAC** (lossless, tagged) or WAV, with retries, cover art and a rip log
+- Copies data CDs/DVDs to an ISO image
+
+**Burning**
+- Burns ISO images to CD-R/RW, DVD-R/RW, DVD+R and DVD+RW, then verifies the disc
+- Burns audio CDs from WAV, FLAC, MP3, M4A and other 44.1 kHz files
+- **Test burn** mode runs the whole burn with the laser off (CD-R/RW and DVD-R/RW)
+- Erases CD-RW / DVD-RW and formats DVD+RW
+
+**Not yet:** AccurateRip checks, gapless (disc-at-once) audio burning, resampling of
+non-44.1 kHz files, Blu-ray.
 
 Copy-protected discs (e.g. encrypted DVD-Video) are detected and refused. DiscDroid does not
 remove copy protection.
@@ -38,6 +45,8 @@ Every push builds the app automatically:
 3. Tap **Connect drive** and allow USB access. Combo drives with a built-in card reader may
    ask twice; the app skips the card reader by itself.
 4. Insert a disc and tap **Read disc**, then **Rip audio CD** or **Copy data disc**.
+5. To burn, put a blank disc in and use the bottom half. Try **Test burn** first with a new
+   drive; it goes through every step without actually writing.
 
 Keep the app open during a rip; the screen stays on automatically.
 
@@ -49,5 +58,7 @@ hub ports, or use a powered USB-C hub.
 
 ## Testing notes
 
-The disc-reading logic is unit-tested against a simulated drive (`app/src/test`). Real
+The disc logic is unit-tested against a simulated reader and a simulated writer that
+enforces real drive rules, and the FLAC encoder is checked bit-for-bit with ffmpeg
+(`app/src/test`, run on every build). Real
 drives vary, so if something fails, copy the log text from the app into an issue.
