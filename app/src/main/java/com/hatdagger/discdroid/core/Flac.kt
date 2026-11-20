@@ -41,7 +41,7 @@ class FlacEncoder(
         repeat(4) { si.bits(0, 32) } // MD5 unknown
         out.write(si.bytes(), 0, si.byteLength())
         // VORBIS_COMMENT (last metadata block)
-        val vendor = "DiscDroid".toByteArray()
+        val vendor = "D2D Disc2Android".toByteArray()
         val entries = tags.filter { it.second.isNotBlank() }.map { "${it.first}=${it.second}".toByteArray(Charsets.UTF_8) }
         val len = 4 + vendor.size + 4 + entries.sumOf { 4 + it.size }
         val vc = ByteArray(4 + len)

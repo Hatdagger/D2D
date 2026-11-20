@@ -24,7 +24,7 @@ data class AlbumInfo(
 }
 
 object MusicBrainz {
-    const val USER_AGENT = "DiscDroid/0.2 ( https://github.com/Hatdagger/d2d )"
+    const val USER_AGENT = "D2D-Disc2Android/0.3 ( https://github.com/Hatdagger/d2d )"
 
     /** The audio session only: Enhanced CDs end at the last audio track. */
     private fun audioLayout(toc: Toc): Triple<List<Track>, Long, Int>? {

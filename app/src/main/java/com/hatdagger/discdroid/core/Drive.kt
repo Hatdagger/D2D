@@ -128,6 +128,15 @@ class Drive(private val transport: ScsiTransport) : AutoCloseable {
         }
     }
 
+    /** Ask for a read speed in KB/s (176 = 1x CD). Slower is quieter for playback. */
+    fun setReadSpeed(kbPerSec: Int) {
+        try {
+            val cdb = byteArrayOf(0xBB.toByte(), 0, (kbPerSec shr 8).toByte(), kbPerSec.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0, 0, 0, 0, 0, 0)
+            run("SET CD SPEED", cdb, Direction.NONE, ByteArray(0), 0, 10_000)
+        } catch (_: ScsiException) {
+        }
+    }
+
     fun eject() {
         try {
             // PREVENT ALLOW MEDIUM REMOVAL: allow

@@ -26,6 +26,7 @@ class FakeRecorder(
     val trackStarts = mutableListOf<Long>()
     var writeType = -1; var trackMode = -1; var dbt = -1; var testWrite = false
     var modeSelected = false
+    var cue: ByteArray? = null
     private var busyLeft = busyWrites
     private var trackStarted = false
 
@@ -70,7 +71,8 @@ class FakeRecorder(
             }
             0x2A -> {
                 if (busyLeft > 0) { busyLeft--; return check(Sense(2, 4, 8)) }
-                val lba = cdb.be32(2); val count = cdb.be16(7)
+                val lba = cdb.be32(2).toInt().toLong(); val count = cdb.be16(7) // LBA is signed (SAO pregap is negative)
+                if (writeType == 2 && cue == null) return check(Sense(5, 0x2C, 0)) // SAO needs a cue sheet first
                 val size = if (profile in 0x09..0x0A) { if (dbt == 0) 2352 else 2048 } else 2048
                 assertEquals(count * size, length)
                 val sequential = profile !in listOf(0x12, 0x13, 0x1A)
@@ -85,7 +87,14 @@ class FakeRecorder(
                 if (!testWrite) state = 1
                 return CommandResult(0, length)
             }
-            0x35 -> return CommandResult(0, 0)
+            0x35 -> { if (writeType == 2 && !testWrite && cue != null) state = 2; return CommandResult(0, 0) }
+            0x5D -> {
+                assertEquals("cue sheet needs SAO write type", 2, writeType)
+                val n = (cdb.u8(6) shl 16) or (cdb.u8(7) shl 8) or cdb.u8(8)
+                assertEquals(n, length); assertEquals(0, n % 8)
+                cue = buffer.copyOf(n); nwa = -150
+                return CommandResult(0, n)
+            }
             0x5B -> {
                 val fn = cdb.u8(2); closes += fn
                 if (fn == 1) { nwa += 150 + 2; track++; trackStarted = false }
@@ -215,6 +224,50 @@ class BurnerTest {
         assertEquals(1001, (s[4].toInt() and 0xFF) or (s[5].toInt() shl 8))
         // padded to the 4-second minimum
         assertTrue(rec.sectors.containsKey(t2 + 299)); assertFalse(rec.sectors.containsKey(t2 + 300))
+    }
+
+    @Test fun burnAudioCdGapless() {
+        val rec = FakeRecorder()
+        val a = wav(588 * 400 + 10, 2) { it % 1000 }   // 400 sectors + 40 bytes
+        val b = wav(588 * 320, 2) { 2000 + it % 7 }    // exactly 320 sectors
+        val tracks = listOf(WavSource("a.wav", ByteArrayInputStream(a)), WavSource("b.wav", ByteArrayInputStream(b)))
+        Burner(Drive(rec), NoopListener) { false }.burnAudio(tracks, BurnOptions(simulate = false, verify = false, gapless = true))
+        assertEquals(2, rec.writeType)
+        assertTrue("no close commands in disc-at-once", rec.closes.isEmpty())
+        assertEquals(2, rec.state)
+        // continuous write from the pregap
+        assertEquals(-150L, rec.trackStarts[0])
+        assertTrue(rec.sectors[-150L]!!.all { it.toInt() == 0 })
+        assertArrayEquals(a.copyOfRange(44, 44 + 2352), rec.sectors[0L])
+        // track 2 starts right after track 1's last byte, mid-sector: no silence in between
+        val s400 = rec.sectors[400L]!!
+        assertArrayEquals(a.copyOfRange(44 + 400 * 2352, a.size), s400.copyOfRange(0, 40))
+        assertArrayEquals(b.copyOfRange(44, 44 + 2312), s400.copyOfRange(40, 2352))
+        // 720 sectors + 40 bytes -> 721 sectors, nothing past that
+        assertTrue(rec.sectors.containsKey(720L)); assertFalse(rec.sectors.containsKey(721L))
+        // cue sheet: lead-in, T1 idx0 at 00:00:00, T1 idx1 at 00:02:00, T2 at 400+150, lead-out at 721+150
+        val cue = rec.cue!!
+        assertEquals(5 * 8, cue.size)
+        assertEquals(0x01, cue.u8(3)); assertEquals(0x00, cue.u8(1))
+        assertArrayEquals(byteArrayOf(0x01, 1, 0, 0, 0, 0, 0, 0), cue.copyOfRange(8, 16))
+        assertArrayEquals(byteArrayOf(0x01, 1, 1, 0, 0, 0, 2, 0), cue.copyOfRange(16, 24))
+        assertArrayEquals(byteArrayOf(0x01, 2, 1, 0, 0, 0, 7, 25), cue.copyOfRange(24, 32)) // 550 = 0:07:25
+        assertArrayEquals(byteArrayOf(0x01, 0xAA.toByte(), 1, 1, 0, 0, 11, 46), cue.copyOfRange(32, 40)) // 871 = 0:11:46
+    }
+
+    @Test fun gaplessLayoutPadsShortTracksAndUsesBcd() {
+        val l = GaplessLayout(List(12) { 2352L * 10 }) // 12 tiny tracks
+        assertEquals(300L * 12, l.totalSectors)
+        assertEquals(300L * 11, l.trackStarts[11])
+        assertEquals(0x12, l.cueSheet().u8(8 * 13 + 1)) // track 12 written as BCD 0x12
+        assertEquals(11, l.trackAt(300L * 11 + 5))
+    }
+
+    @Test fun gaplessTestBurnWritesNothing() {
+        val rec = FakeRecorder()
+        Burner(Drive(rec), NoopListener) { false }.burnAudio(listOf(WavSource("a", ByteArrayInputStream(wav(588 * 300, 2) { 1 }))),
+            BurnOptions(simulate = true, verify = false, gapless = true))
+        assertTrue(rec.testWrite); assertTrue(rec.sectors.isEmpty()); assertEquals(0, rec.state)
     }
 
     @Test fun audioNeedsCd() {

@@ -7,7 +7,6 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.usb.UsbDevice
@@ -19,13 +18,18 @@ import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowManager
+import android.widget.BaseAdapter
 import android.widget.Button
-import android.widget.CheckBox
+import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ListView
 import android.widget.ProgressBar
 import android.widget.ScrollView
+import android.widget.SeekBar
+import android.widget.Switch
 import android.widget.TextView
 import com.hatdagger.discdroid.core.AlbumInfo
 import com.hatdagger.discdroid.core.AudioFormat
@@ -39,9 +43,13 @@ import com.hatdagger.discdroid.core.IsoRipper
 import com.hatdagger.discdroid.core.MusicBrainz
 import com.hatdagger.discdroid.core.Names
 import com.hatdagger.discdroid.core.PcmSource
+import com.hatdagger.discdroid.core.Playlists
 import com.hatdagger.discdroid.core.Profiles
 import com.hatdagger.discdroid.core.RipListener
+import com.hatdagger.discdroid.core.Song
+import com.hatdagger.discdroid.core.SongSort
 import com.hatdagger.discdroid.core.Toc
+import com.hatdagger.discdroid.core.Track
 import com.hatdagger.discdroid.core.WavSource
 import java.io.BufferedOutputStream
 import java.io.File
@@ -70,7 +78,15 @@ class MainActivity : Activity(), RipListener {
 
     private val candidates = ArrayDeque<UsbDevice>()
 
+    private val ui2 by lazy { Ui(this) }
+    private lateinit var player: Player
+    private val meta = Executors.newSingleThreadExecutor()
+
+    /** Songs to burn, in burn order. Also what the Player plays in "Burn list" mode. */
+    private val burnList = mutableListOf<Song>()
+
     private lateinit var status: TextView
+    private lateinit var statusDot: View
     private lateinit var folderText: TextView
     private lateinit var progressBar: ProgressBar
     private lateinit var progressText: TextView
@@ -80,10 +96,36 @@ class MainActivity : Activity(), RipListener {
     @Volatile private var activeLog: LogPane? = null
     private val buttons = mutableListOf<Button>()
 
-    private lateinit var optFlac: CheckBox
-    private lateinit var optOnline: CheckBox
-    private lateinit var optSimulate: CheckBox
-    private lateinit var optVerify: CheckBox
+    private lateinit var optFlac: Switch
+    private lateinit var optOnline: Switch
+    private lateinit var optSimulate: Switch
+    private lateinit var optVerify: Switch
+    private lateinit var optGapless: Switch
+
+    // bottom screen
+    private lateinit var bottomCard: LinearLayout
+    private lateinit var tabs: Ui.Segments
+    private lateinit var playerPage: View
+    private lateinit var burnPage: View
+    private lateinit var burnSummary: TextView
+
+    // player
+    private var showDisc = false
+    private lateinit var listSource: Ui.Segments
+    private lateinit var listTools: View
+    private lateinit var trackList: ListView
+    private lateinit var emptyText: TextView
+    private lateinit var listSummary: TextView
+    private lateinit var nowTitle: TextView
+    private lateinit var nowSub: TextView
+    private lateinit var seek: SeekBar
+    private lateinit var timeText: TextView
+    private lateinit var btnPlay: Button
+    private var userSeeking = false
+    private val adapter = TrackAdapter()
+    private val ticker = object : Runnable {
+        override fun run() { if (player.isActive) updateNowPlaying(); ui.postDelayed(this, 500) }
+    }
 
     private var lastProgressPost = 0L
     private var progressStart = 0L
@@ -92,7 +134,9 @@ class MainActivity : Activity(), RipListener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        player = Player(this, onChange = { refreshPlayer() }, onError = { msg -> burnLog.add(msg); toastLine(msg) })
         buildUi()
+        loadBurnList()
         val filter = IntentFilter().apply {
             addAction(ACTION_USB_PERMISSION)
             addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
@@ -103,9 +147,11 @@ class MainActivity : Activity(), RipListener {
         } else {
             registerReceiver(usbReceiver, filter)
         }
-        ripLog.add("Plug in your USB CD/DVD drive and tap Connect drive.")
-        burnLog.add("Burn ISO images to CD/DVD, or make an audio CD from music files.")
+        ripLog.add("Plug in your USB CD/DVD drive and tap Connect.")
+        burnLog.add("Burn ISO images, or make an audio CD from your burn list (music or video files) in the Player tab.")
         showFolder()
+        refreshPlayer()
+        ui.post(ticker)
         handleIntent(intent)
     }
 
@@ -120,20 +166,31 @@ class MainActivity : Activity(), RipListener {
 
     override fun onDestroy() {
         cancel.set(true)
+        ui.removeCallbacks(ticker)
+        player.release()
         unregisterReceiver(usbReceiver)
         worker.shutdown()
+        meta.shutdown()
         try { drive?.close() } catch (_: Exception) {}
         super.onDestroy()
     }
 
     // ---------------------------------------------------------------- UI
 
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun dp(v: Int) = ui2.dp(v)
 
     /** A scrolling log area belonging to one half of the screen. */
     private inner class LogPane {
-        val text = TextView(this@MainActivity).apply { typeface = Typeface.MONOSPACE; textSize = 12f; setTextIsSelectable(true) }
-        val scroll = ScrollView(this@MainActivity).apply { addView(text) }
+        val text = TextView(this@MainActivity).apply {
+            typeface = Typeface.MONOSPACE; textSize = 12f; setTextIsSelectable(true)
+            setTextColor(Palette.LOG); setLineSpacing(0f, 1.15f)
+        }
+        val scroll = ScrollView(this@MainActivity).apply {
+            addView(text)
+            background = ui2.rounded(Palette.alpha(0xFF000000.toInt(), 70), 14)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            isVerticalScrollBarEnabled = false
+        }
         fun add(msg: String) {
             ui.post {
                 text.append(msg + "\n")
@@ -142,47 +199,29 @@ class MainActivity : Activity(), RipListener {
         }
     }
 
-    private fun panel(title: String, accent: Int): LinearLayout {
-        val bg = GradientDrawable().apply {
-            setColor(Color.argb(40, Color.red(accent), Color.green(accent), Color.blue(accent)))
-            setStroke(dp(1), Color.argb(110, Color.red(accent), Color.green(accent), Color.blue(accent)))
-            setCornerRadius(dp(14).toFloat())
-        }
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = bg
-            setPadding(dp(12), dp(8), dp(12), dp(8))
-            addView(TextView(this@MainActivity).apply {
-                text = title; textSize = 18f; setTextColor(accent); setTypeface(typeface, Typeface.BOLD)
-            })
-        }
-    }
+    private fun btn(label: String, accent: Int, style: Ui.Style = Ui.Style.TONAL, track: Boolean = true, action: () -> Unit): Button =
+        ui2.button(label, accent, style, action).also { if (track) buttons += it }
 
-    private fun row(vararg items: Pair<String, () -> Unit>): LinearLayout {
-        val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        for ((label, action) in items) {
-            val b = Button(this).apply { text = label; isAllCaps = false; setOnClickListener { action() } }
-            r.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            buttons += b
-        }
-        return r
-    }
+    private fun option(label: String, key: String, default: Boolean, accent: Int): Switch =
+        ui2.toggle(label, accent, prefs.getBoolean(key, default)) { prefs.edit().putBoolean(key, it).apply() }
 
-    private fun option(label: String, key: String, default: Boolean): CheckBox = CheckBox(this).apply {
-        text = label
-        isChecked = prefs.getBoolean(key, default)
-        setOnCheckedChangeListener { _, checked -> prefs.edit().putBoolean(key, checked).apply() }
-    }
-
-    private fun optionRow(vararg boxes: CheckBox) = LinearLayout(this).apply {
+    private fun flow(vararg views: View) = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL
-        for (b in boxes) addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        gravity = Gravity.CENTER_VERTICAL
+        for (v in views) addView(v, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
     }
+
+    private fun gap(h: Int) = View(this).apply { layoutParams = LinearLayout.LayoutParams(1, dp(h)) }
 
     private fun buildUi() {
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val side = dp(12)
-        val extraTop = dp(16)
+        @Suppress("DEPRECATION")
+        if (Build.VERSION.SDK_INT < 35) { window.statusBarColor = Palette.BG_TOP; window.navigationBarColor = Palette.BG_BOTTOM }
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(Palette.BG_TOP, Palette.BG_BOTTOM))
+        }
+        val side = dp(14)
         // Keep clear of the status bar and navigation bar (Android 15 draws edge-to-edge).
         root.setOnApplyWindowInsetsListener { v, insets ->
             val top: Int
@@ -196,71 +235,407 @@ class MainActivity : Activity(), RipListener {
                 @Suppress("DEPRECATION")
                 bottom = insets.systemWindowInsetBottom
             }
-            v.setPadding(side, top + extraTop, side, bottom + side)
+            v.setPadding(side, top + dp(10), side, bottom + dp(10))
             insets
         }
-        root.setPadding(side, dp(40), side, side)
+        root.setPadding(side, dp(36), side, side)
 
-        // Header: app name, drive, output folder, and drive-level buttons
-        val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        header.addView(TextView(this).apply { text = "DiscDroid"; textSize = 22f; setTypeface(typeface, Typeface.BOLD) })
-        status = TextView(this).apply { text = "   No drive connected"; textSize = 14f }
-        header.addView(status)
-        root.addView(header)
-        folderText = TextView(this).apply { textSize = 12f }
-        root.addView(folderText)
-        root.addView(row("Connect drive" to ::connectDrive, "Output folder" to ::pickFolder, "Eject" to ::eject))
-
-        // Top screen: ripping (blue)
-        val blue = Color.rgb(66, 150, 255)
-        ripLog = LogPane()
-        optFlac = option("Save as FLAC (smaller, lossless)", KEY_FLAC, true)
-        optOnline = option("Look up names online", KEY_ONLINE, true)
-        val top = panel("RIP", blue).apply {
-            addView(row("Read disc" to ::readDisc, "Rip audio CD" to ::ripAudio, "Copy data disc (ISO)" to ::ripIso))
-            addView(optionRow(optFlac, optOnline))
-            addView(ripLog.scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        // ---- Header: drive status and output folder, with the drive buttons
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            background = ui2.rounded(Palette.SURFACE, 22)
+            setPadding(dp(14), dp(8), dp(8), dp(8))
         }
-        root.addView(top, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f).apply { topMargin = dp(8) })
+        statusDot = View(this).apply { background = ui2.rounded(0xFF5B6678.toInt(), 6) }
+        header.addView(statusDot, LinearLayout.LayoutParams(dp(10), dp(10)).apply { marginEnd = dp(10) })
+        val info = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        status = ui2.text("No drive connected", 15f, Palette.TEXT, bold = true).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END }
+        folderText = ui2.text("", 12f, Palette.TEXT_DIM).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.MIDDLE }
+        info.addView(status); info.addView(folderText)
+        header.addView(info, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        header.addView(btn("Connect", Palette.BLUE, Ui.Style.FILLED, action = ::connectDrive))
+        header.addView(btn("Folder", Palette.BLUE, action = ::pickFolder), LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginStart = dp(6) })
+        header.addView(btn("Eject", Palette.BLUE, action = ::eject), LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginStart = dp(6) })
+        root.addView(header)
 
-        // Hinge: progress + cancel, shared by both screens
+        // ---- Top screen: ripping (blue)
+        ripLog = LogPane()
+        optFlac = option("Save as FLAC", KEY_FLAC, true, Palette.BLUE)
+        optOnline = option("Look up names online", KEY_ONLINE, true, Palette.BLUE)
+        val top = ui2.card(Palette.BLUE).apply {
+            addView(ui2.sectionTitle("RIP", Palette.BLUE, "Disc → files"))
+            addView(gap(10))
+            addView(ui2.row(
+                btn("Read disc", Palette.BLUE, action = ::readDisc),
+                btn("Rip audio CD", Palette.BLUE, Ui.Style.FILLED, action = ::ripAudio),
+                btn("Copy disc (ISO)", Palette.BLUE, action = ::ripIso),
+            ))
+            addView(flow(optFlac, optOnline))
+            addView(ripLog.scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f).apply { topMargin = dp(4) })
+        }
+        root.addView(top, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f).apply { topMargin = dp(10) })
+
+        // ---- Hinge: progress + cancel, shared by both screens
         val hinge = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(6), 0, dp(6))
+            setPadding(dp(6), dp(8), 0, dp(8))
         }
         val progressCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
-        progressText = TextView(this).apply { textSize = 12f; text = "Idle" }
+        progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000; ui2.tint(this, Palette.AMBER) }
+        progressText = ui2.text("Idle", 12f, Palette.TEXT_DIM)
         progressCol.addView(progressBar)
         progressCol.addView(progressText)
         hinge.addView(progressCol, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        btnCancel = Button(this).apply {
-            text = "Cancel"; isAllCaps = false; isEnabled = false
-            setOnClickListener { cancel.set(true); log("Cancelling…") }
-        }
-        hinge.addView(btnCancel)
+        btnCancel = ui2.button("Cancel", Palette.AMBER, Ui.Style.OUTLINE) { cancel.set(true); log("Cancelling…") }.apply { isEnabled = false; alpha = 0.4f }
+        hinge.addView(btnCancel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginStart = dp(12) })
         root.addView(hinge)
 
-        // Bottom screen: burning (red)
-        val red = Color.rgb(255, 90, 80)
-        burnLog = LogPane()
-        optSimulate = option("Test burn (laser off)", KEY_SIMULATE, false)
-        optVerify = option("Verify after burning", KEY_VERIFY, true)
-        val bottom = panel("BURN", red).apply {
-            addView(row("Burn ISO image" to ::pickIso, "Burn audio CD" to ::pickAudio, "Erase disc" to ::confirmErase))
-            addView(optionRow(optSimulate, optVerify))
-            addView(burnLog.scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
-        }
-        root.addView(bottom, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        // ---- Bottom screen: Player (green) and Burn (red) tabs
+        bottomCard = ui2.card(Palette.GREEN)
+        tabs = ui2.Segments(listOf("♪  Player", "●  Burn"), listOf(Palette.GREEN, Palette.RED)) { showTab(it) }
+        bottomCard.addView(tabs.view)
+        val pages = FrameLayout(this)
+        playerPage = buildPlayerPage()
+        burnPage = buildBurnPage()
+        pages.addView(playerPage, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        pages.addView(burnPage, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        bottomCard.addView(pages, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f).apply { topMargin = dp(10) })
+        root.addView(bottomCard, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.3f))
+        showTab(prefs.getInt(KEY_TAB, 0))
 
         setContentView(root)
+    }
+
+    private fun showTab(i: Int) {
+        tabs.select(i)
+        prefs.edit().putInt(KEY_TAB, i).apply()
+        playerPage.visibility = if (i == 0) View.VISIBLE else View.GONE
+        burnPage.visibility = if (i == 1) View.VISIBLE else View.GONE
+        bottomCard.background = ui2.cardBackground(if (i == 0) Palette.GREEN else Palette.RED)
+    }
+
+    private fun buildPlayerPage(): View = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+
+        // What to show: the burn list, or the CD in the drive
+        listSource = ui2.Segments(listOf("Burn list", "Disc"), listOf(Palette.GREEN, Palette.GREEN)) { i ->
+            showDisc = i == 1
+            if (showDisc && toc == null && drive != null && !busy) readDisc()
+            refreshPlayer()
+        }
+        val sourceRow = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        sourceRow.addView(listSource.view, LinearLayout.LayoutParams(dp(220), LinearLayout.LayoutParams.WRAP_CONTENT))
+        listSummary = ui2.text("", 12f, Palette.TEXT_DIM).apply { gravity = Gravity.END }
+        sourceRow.addView(listSummary, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = dp(10) })
+        addView(sourceRow)
+
+        listTools = ui2.row(
+            btn("+ Add files", Palette.GREEN, Ui.Style.FILLED, track = false, action = ::pickSongs),
+            btn("Sort", Palette.GREEN, track = false, action = ::chooseSort),
+            btn("Clear", Palette.GREEN, Ui.Style.GHOST, track = false, action = ::confirmClear),
+        ).apply { setPadding(0, dp(8), 0, 0) }
+        addView(listTools)
+
+        val listBox = FrameLayout(this@MainActivity).apply { background = ui2.rounded(Palette.alpha(0xFF000000.toInt(), 70), 14) }
+        trackList = ListView(this@MainActivity).apply {
+            adapter = this@MainActivity.adapter
+            divider = null; dividerHeight = 0
+            selector = android.graphics.drawable.ColorDrawable(0)
+            setPadding(dp(4), dp(4), dp(4), dp(4)); clipToPadding = false
+        }
+        emptyText = ui2.text("", 13f, Palette.TEXT_DIM).apply { gravity = Gravity.CENTER; setPadding(dp(24), dp(12), dp(24), dp(12)) }
+        listBox.addView(trackList, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        listBox.addView(emptyText, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        trackList.emptyView = emptyText
+        addView(listBox, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f).apply { topMargin = dp(8) })
+
+        // Now playing + transport controls
+        val now = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.VERTICAL
+            background = ui2.rounded(Palette.SURFACE_HI, 16)
+            setPadding(dp(14), dp(10), dp(14), dp(8))
+        }
+        nowTitle = ui2.text("Nothing playing", 15f, Palette.TEXT, bold = true).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END }
+        nowSub = ui2.text("Tap a song to play it", 12f, Palette.TEXT_DIM).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END }
+        now.addView(nowTitle); now.addView(nowSub)
+        val seekRow = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        seek = SeekBar(this@MainActivity).apply {
+            max = 1000; ui2.tint(this, Palette.GREEN)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
+                    if (fromUser) timeText.text = timeLabel(player.durationMs() * p / 1000, player.durationMs())
+                }
+                override fun onStartTrackingTouch(s: SeekBar) { userSeeking = true }
+                override fun onStopTrackingTouch(s: SeekBar) {
+                    userSeeking = false
+                    player.seekTo(player.durationMs() * s.progress / 1000)
+                }
+            })
+        }
+        timeText = ui2.text("0:00 / 0:00", 12f, Palette.TEXT_DIM)
+        seekRow.addView(seek, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        seekRow.addView(timeText)
+        now.addView(seekRow)
+        btnPlay = ui2.button("▶  Play", Palette.GREEN, Ui.Style.FILLED) { playPause() }
+        now.addView(ui2.row(
+            ui2.button("⏮", Palette.GREEN) { player.previous() },
+            btnPlay,
+            ui2.button("⏭", Palette.GREEN) { player.next() },
+            ui2.button("■  Stop", Palette.GREEN, Ui.Style.GHOST) { player.stop(); refreshPlayer() },
+        ))
+        addView(now, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
+    }
+
+    private fun buildBurnPage(): View = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        burnLog = LogPane()
+        optSimulate = option("Test burn (laser off)", KEY_SIMULATE, false, Palette.RED)
+        optVerify = option("Verify after burning", KEY_VERIFY, true, Palette.RED)
+        optGapless = option("No gaps between tracks", KEY_GAPLESS, false, Palette.RED)
+        burnSummary = ui2.text("", 13f, Palette.TEXT_DIM).apply { setPadding(dp(2), 0, 0, dp(8)) }
+        addView(burnSummary)
+        addView(ui2.row(
+            btn("Burn audio CD", Palette.RED, Ui.Style.FILLED, action = ::burnAudioFromList),
+            btn("Burn ISO image", Palette.RED, action = ::pickIso),
+            btn("Erase disc", Palette.RED, action = ::confirmErase),
+        ))
+        addView(flow(optSimulate, optVerify))
+        addView(optGapless)
+        addView(burnLog.scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f).apply { topMargin = dp(4) })
+    }
+
+    // ---------------------------------------------------------------- player
+
+    /** One row of the track list. */
+    private inner class TrackAdapter : BaseAdapter() {
+        override fun getCount() = if (showDisc) discTracks().size else burnList.size
+        override fun getItem(position: Int): Any = position
+        override fun getItemId(position: Int) = position.toLong()
+
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
+            val playingHere = player.isActive && player.index == position &&
+                (player.source == Player.Source.DISC) == showDisc
+            val row = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(10), dp(6), dp(4), dp(6))
+                background = ui2.ripple(ui2.rounded(if (playingHere) Palette.alpha(Palette.GREEN, 40) else 0, 12), Palette.GREEN)
+                setOnClickListener { playItem(position) }
+            }
+            val title: String; val sub: String; val length: String
+            if (showDisc) {
+                val t = discTracks()[position]
+                val a = album
+                title = a?.tracks?.get(t.number)?.title ?: "Track ${t.number}"
+                sub = a?.tracks?.get(t.number)?.artist ?: a?.artist ?: "Audio CD"
+                length = t.durationText()
+            } else {
+                val s = burnList[position]
+                title = s.displayTitle
+                sub = listOfNotNull(if (s.isVideo) "Video sound" else null, s.artist, s.fileName).joinToString(" · ")
+                length = if (s.durationMs > 0) Playlists.clock(s.durationMs / 1000) else ""
+            }
+            row.addView(ui2.text(if (playingHere) (if (player.isPaused) "❚❚" else "▶") else "${position + 1}", 13f,
+                if (playingHere) Palette.GREEN else Palette.TEXT_DIM, bold = true).apply { gravity = Gravity.CENTER },
+                LinearLayout.LayoutParams(dp(30), LinearLayout.LayoutParams.WRAP_CONTENT))
+            val col = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(8), 0, dp(8), 0) }
+            col.addView(ui2.text(title, 14f, Palette.TEXT, bold = playingHere).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END })
+            col.addView(ui2.text(sub, 11f, Palette.TEXT_DIM).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END })
+            row.addView(col, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            row.addView(ui2.text(length, 12f, Palette.TEXT_DIM))
+            if (!showDisc) {
+                row.addView(iconButton("▲") { moveSong(position, position - 1) })
+                row.addView(iconButton("▼") { moveSong(position, position + 1) })
+                row.addView(iconButton("✕") { removeSong(position) })
+            }
+            return row
+        }
+    }
+
+    private fun iconButton(glyph: String, action: () -> Unit) = ui2.text(glyph, 14f, Palette.TEXT_DIM).apply {
+        gravity = Gravity.CENTER
+        background = ui2.ripple(ui2.rounded(0, 14), Palette.GREEN)
+        setOnClickListener { action() }
+        layoutParams = LinearLayout.LayoutParams(dp(38), dp(38))
+    }
+
+    private fun discTracks(): List<Track> = toc?.audioTracks ?: emptyList()
+
+    private fun playItem(position: Int) {
+        if (showDisc) {
+            val d = drive
+            if (d == null) { toastLine("Connect the drive first."); return }
+            if (busy) { toastLine("Wait for the current job to finish."); return }
+            player.playDisc(d, discTracks(), position)
+        } else {
+            player.playSongs(burnList.toList(), position)
+        }
+        refreshPlayer()
+    }
+
+    private fun playPause() {
+        when {
+            player.isActive -> player.togglePause()
+            showDisc && discTracks().isNotEmpty() -> playItem(0)
+            !showDisc && burnList.isNotEmpty() -> playItem(0)
+            else -> toastLine(if (showDisc) "No audio CD read yet — insert one and tap Read disc." else "Add some songs first.")
+        }
+    }
+
+    private fun refreshPlayer() {
+        if (!::trackList.isInitialized) return
+        listSource.select(if (showDisc) 1 else 0)
+        listTools.visibility = if (showDisc) View.GONE else View.VISIBLE
+        emptyText.text = if (showDisc) {
+            if (drive == null) "Connect the drive, insert an audio CD, then tap Read disc."
+            else if (toc == null) "No disc read yet. Insert an audio CD and tap Read disc."
+            else "This disc has no audio tracks."
+        } else "Your burn list is empty.\nTap + Add files to pick music or videos (MP3, FLAC, M4A, WAV, MP4, WebM, MKV…)."
+        listSummary.text = if (showDisc) {
+            val t = discTracks()
+            if (t.isEmpty()) "" else "${t.size} tracks · ${Playlists.clock(t.sumOf { it.lengthSectors } / 75)}"
+        } else if (burnList.isEmpty()) "" else Playlists.summary(burnList)
+        adapter.notifyDataSetChanged()
+        updateBurnSummary()
+        updateNowPlaying()
+    }
+
+    private fun updateNowPlaying() {
+        if (!::nowTitle.isInitialized) return
+        if (!player.isActive) {
+            nowTitle.text = "Nothing playing"
+            nowSub.text = if (showDisc) "Tap a track to play it from the disc" else "Tap a song to play it"
+            seek.progress = 0
+            timeText.text = "0:00 / 0:00"
+            btnPlay.text = "▶  Play"
+            return
+        }
+        if (player.source == Player.Source.FILES) {
+            val s = player.currentSong
+            nowTitle.text = s?.displayTitle ?: ""
+            nowSub.text = listOfNotNull(s?.artist, "Burn list ${player.index + 1}/${burnList.size}").joinToString(" · ")
+        } else {
+            val t = discTracks().getOrNull(player.index)
+            val a = album
+            nowTitle.text = t?.let { a?.tracks?.get(it.number)?.title ?: "Track ${it.number}" } ?: ""
+            nowSub.text = listOfNotNull(a?.artist, a?.title, "Disc track ${player.index + 1}/${discTracks().size}").joinToString(" · ")
+        }
+        val pos = player.positionMs(); val dur = player.durationMs()
+        if (!userSeeking) {
+            seek.progress = if (dur > 0) (pos * 1000 / dur).toInt() else 0
+            timeText.text = timeLabel(pos, dur)
+        }
+        btnPlay.text = if (player.isPaused) "▶  Play" else "❚❚  Pause"
+    }
+
+    private fun timeLabel(pos: Long, dur: Long) = "${Playlists.clock(pos / 1000)} / ${Playlists.clock(dur / 1000)}"
+
+    private fun toastLine(msg: String) {
+        ui.post { android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show() }
+    }
+
+    // ---------------------------------------------------------------- burn list
+
+    private fun burnListChanged() {
+        player.updateSongs(burnList.toList())
+        saveBurnList()
+        refreshPlayer()
+    }
+
+    private fun moveSong(from: Int, to: Int) {
+        Playlists.move(burnList, from, to)
+        burnListChanged()
+    }
+
+    private fun removeSong(i: Int) {
+        if (i !in burnList.indices) return
+        burnList.removeAt(i)
+        burnListChanged()
+    }
+
+    private fun confirmClear() {
+        if (burnList.isEmpty()) return
+        confirm("Clear the burn list?", "This removes all ${burnList.size} songs from the list. The files themselves are not deleted.", "Clear") {
+            burnList.clear()
+            burnListChanged()
+        }
+    }
+
+    private fun chooseSort() {
+        if (burnList.size < 2) return
+        val options = SongSort.values()
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Sort burn list by")
+            .setItems(options.map { it.label }.toTypedArray()) { _, which ->
+                val sorted = options[which].apply(burnList)
+                burnList.clear(); burnList.addAll(sorted)
+                burnListChanged()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun pickSongs() {
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*")
+            .putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("audio/*", "video/*"))
+            .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        startActivityForResult(i, REQ_SONGS)
+    }
+
+    private fun addSongs(uris: List<Uri>) {
+        val added = mutableListOf<Song>()
+        for (u in uris) {
+            try { contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {}
+            if (burnList.any { it.key == u.toString() }) continue
+            added += Song(u.toString(), Files.nameAndSize(this, u).first)
+        }
+        // new picks go to the end, in file-name order
+        burnList.addAll(SongSort.FILE_NAME.apply(added))
+        burnListChanged()
+        if (added.isNotEmpty()) toastLine("Added ${added.size} file${if (added.size == 1) "" else "s"}.")
+        loadTags(added)
+    }
+
+    /** Reads titles and lengths in the background, then redraws. */
+    private fun loadTags(songs: List<Song>) {
+        if (songs.isEmpty()) return
+        meta.execute {
+            for (s in songs) Files.readTags(this, s)
+            ui.post { refreshPlayer() }
+        }
+    }
+
+    private fun saveBurnList() {
+        prefs.edit().putString(KEY_BURN_LIST, burnList.joinToString("\n") { it.key + "\t" + it.fileName }).apply()
+    }
+
+    private fun loadBurnList() {
+        val s = prefs.getString(KEY_BURN_LIST, null) ?: return
+        burnList.clear()
+        for (line in s.split('\n')) {
+            if (line.isBlank()) continue
+            val key = line.substringBefore('\t')
+            burnList += Song(key, line.substringAfter('\t', Uri.parse(key).lastPathSegment ?: "file"))
+        }
+        loadTags(burnList.toList())
+    }
+
+    private fun updateBurnSummary() {
+        if (!::burnSummary.isInitialized) return
+        burnSummary.text = if (burnList.isEmpty()) "Burn list: empty — add songs or videos in the Player tab."
+        else {
+            val secs = burnList.sumOf { it.durationMs } / 1000
+            val over = secs > Playlists.CD_SECONDS
+            "Burn list: ${Playlists.summary(burnList)} of 80:00" + if (over) "  — too long for one CD!" else ""
+        }
     }
 
     private fun setBusy(b: Boolean) {
         busy = b
         ui.post {
-            buttons.forEach { it.isEnabled = !b }
+            buttons.forEach { it.isEnabled = !b; it.alpha = if (b) 0.4f else 1f }
             btnCancel.isEnabled = b
+            btnCancel.alpha = if (b) 1f else 0.4f
             if (b) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
@@ -292,7 +667,7 @@ class MainActivity : Activity(), RipListener {
     }
 
     private fun confirm(title: String, message: String, ok: String, action: () -> Unit) {
-        AlertDialog.Builder(this)
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle(title)
             .setMessage(message)
             .setPositiveButton(ok) { _, _ -> action() }
@@ -304,7 +679,7 @@ class MainActivity : Activity(), RipListener {
 
     private fun showFolder() {
         val uri = prefs.getString(KEY_FOLDER, null)
-        folderText.text = if (uri == null) "Output folder: not chosen yet" else "Output folder: ${Uri.parse(uri).lastPathSegment}"
+        folderText.text = if (uri == null) "Rips go to: no folder chosen yet (tap Folder)" else "Rips go to: ${Uri.parse(uri).lastPathSegment?.substringAfter(':')}"
     }
 
     @Suppress("DEPRECATION")
@@ -317,15 +692,6 @@ class MainActivity : Activity(), RipListener {
         if (drive == null) { burnLog.add("Connect a drive first."); return }
         val i = Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*")
         startActivityForResult(i, REQ_ISO)
-    }
-
-    @Suppress("DEPRECATION")
-    private fun pickAudio() {
-        if (drive == null) { burnLog.add("Connect a drive first."); return }
-        val i = Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("audio/*")
-            .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
-        burnLog.add("Select the tracks. They'll be burned in file-name order (e.g. 01 …, 02 …).")
-        startActivityForResult(i, REQ_AUDIO)
     }
 
     @Deprecated("Deprecated in Java")
@@ -344,12 +710,12 @@ class MainActivity : Activity(), RipListener {
                 ripLog.add("Output folder set.")
             }
             REQ_ISO -> data.data?.let { confirmBurnIso(it) }
-            REQ_AUDIO -> {
+            REQ_SONGS -> {
                 val uris = mutableListOf<Uri>()
                 val clip = data.clipData
                 if (clip != null) for (i in 0 until clip.itemCount) uris += clip.getItemAt(i).uri
                 else data.data?.let { uris += it }
-                if (uris.isNotEmpty()) confirmBurnAudio(uris)
+                if (uris.isNotEmpty()) addSongs(uris)
             }
         }
     }
@@ -357,7 +723,7 @@ class MainActivity : Activity(), RipListener {
     private fun outputFolder(): OutputFolder? {
         val s = prefs.getString(KEY_FOLDER, null)
         if (s == null) {
-            ripLog.add("Choose an output folder first (tap Output folder).")
+            ripLog.add("Choose where rips go first (tap Folder).")
             return null
         }
         return OutputFolder(contentResolver, Uri.parse(s))
@@ -421,7 +787,7 @@ class MainActivity : Activity(), RipListener {
                 driveDeviceName = device.deviceName
                 ui.post { candidates.clear() }
                 prefs.edit().putString(KEY_LAST_DRIVE, "%04X:%04X".format(device.vendorId, device.productId)).apply()
-                ui.post { status.text = "   ${inq.name} (fw ${inq.revision})" }
+                ui.post { status.text = inq.name; statusDot.background = ui2.rounded(Palette.GREEN, 6) }
                 log("Connected: ${inq.name}, firmware ${inq.revision}")
                 setBusy(false)
                 ui.post { readDisc() }
@@ -446,9 +812,12 @@ class MainActivity : Activity(), RipListener {
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                     if (device != null && device.deviceName == driveDeviceName) {
                         cancel.set(true)
+                        player.stopDisc()
                         try { drive?.close() } catch (_: Exception) {}
                         drive = null; driveDeviceName = null; toc = null; album = null
-                        status.text = "   No drive connected"
+                        status.text = "No drive connected"
+                        statusDot.background = ui2.rounded(0xFF5B6678.toInt(), 6)
+                        refreshPlayer()
                         log("Drive disconnected. If you didn't unplug it, it may be short on power.")
                     }
                 }
@@ -464,6 +833,7 @@ class MainActivity : Activity(), RipListener {
         val d = drive
         if (d == null) { pane.add("Connect a drive first."); return }
         if (busy) return
+        player.stopDisc() // the drive can only do one thing at a time
         cancel.set(false)
         activeLog = pane
         setBusy(true)
@@ -477,7 +847,7 @@ class MainActivity : Activity(), RipListener {
                 log("$name failed: ${e.message}")
             } finally {
                 setBusy(false)
-                ui.post { progressText.text = "Idle" }
+                ui.post { progressText.text = "Idle"; refreshPlayer() }
             }
         }
     }
@@ -504,8 +874,8 @@ class MainActivity : Activity(), RipListener {
             val title = a?.tracks?.get(tr.number)?.title?.let { "  $it" } ?: ""
             log("  %2d  %s  %s%s".format(tr.number, kind, if (tr.isData) "%,d sectors".format(tr.lengthSectors) else tr.durationText(), title))
         }
-        if (t.audioTracks.isNotEmpty()) log("Ready: tap \"Rip audio CD\".")
-        if (t.dataTracks.isNotEmpty()) log("Ready: tap \"Copy data disc\" for an ISO image.")
+        if (t.audioTracks.isNotEmpty()) log("Ready: tap \"Rip audio CD\", or play it in the Player tab (Disc).")
+        if (t.dataTracks.isNotEmpty()) log("Ready: tap \"Copy disc (ISO)\" for an ISO image.")
     }
 
     /** MusicBrainz first (if enabled), then CD-TEXT. */
@@ -562,7 +932,7 @@ class MainActivity : Activity(), RipListener {
                 } catch (e: Exception) { log("No cover art (${e.message}).") }
             }
 
-            val report = StringBuilder("DiscDroid rip log\nDrive: ${d.description}\nDisc: $albumName\n")
+            val report = StringBuilder("D2D Disc2Android rip log\nDrive: ${d.description}\nDisc: $albumName\n")
             a?.let { report.append("Names from: ${it.source}\n") }
             MusicBrainz.discId(t)?.let { report.append("MusicBrainz disc ID: $it\n") }
             report.append("\n")
@@ -637,7 +1007,7 @@ class MainActivity : Activity(), RipListener {
 
     // ---------------------------------------------------------------- burning
 
-    private fun burnOptions() = BurnOptions(optSimulate.isChecked, optVerify.isChecked)
+    private fun burnOptions() = BurnOptions(optSimulate.isChecked, optVerify.isChecked, optGapless.isChecked)
 
     private fun confirmBurnIso(uri: Uri) {
         val (name, size) = Files.nameAndSize(this, uri)
@@ -663,13 +1033,22 @@ class MainActivity : Activity(), RipListener {
         log(if (opts.simulate) "Test burn OK. Untick \"Test burn\" to burn for real." else "Done!")
     }
 
-    private fun confirmBurnAudio(uris: List<Uri>) {
-        val files = uris.map { it to Files.nameAndSize(this, it).first }.sortedBy { it.second.lowercase(Locale.ROOT) }
+    private fun burnAudioFromList() {
+        if (drive == null) { burnLog.add("Connect a drive first."); return }
+        if (burnList.isEmpty()) {
+            burnLog.add("Your burn list is empty. Add music or video files in the Player tab, put them in order, then come back here.")
+            showTab(0); showDisc = false; refreshPlayer()
+            return
+        }
         val opts = burnOptions()
-        val list = files.mapIndexed { i, f -> "%2d. %s".format(i + 1, f.second) }.joinToString("\n")
+        val files = burnList.map { Uri.parse(it.key) to it.fileName }
+        val list = burnList.mapIndexed { i, s -> "%2d. %s".format(i + 1, s.displayTitle) }.joinToString("\n")
+        val secs = burnList.sumOf { it.durationMs } / 1000
+        val mode = if (opts.gapless) "with no gaps between tracks" else "with 2-second gaps between tracks"
+        val warn = if (secs > Playlists.CD_SECONDS) "\n\nWarning: this is ${Playlists.clock(secs)}, longer than an 80-minute CD." else ""
         val go = { burnAudio(files, opts) }
         if (opts.simulate) go()
-        else confirm("Burn audio CD?", "Burn these ${files.size} tracks to the CD-R? This can't be undone.\n\n$list", "Burn", go)
+        else confirm("Burn audio CD?", "Burn these ${files.size} tracks $mode? This can't be undone.$warn\n\n$list", "Burn", go)
     }
 
     private fun burnAudio(files: List<Pair<Uri, String>>, opts: BurnOptions) = job("Audio CD", burnLog) { d ->
@@ -681,11 +1060,11 @@ class MainActivity : Activity(), RipListener {
                 val (uri, name) = f
                 log("Preparing ${i + 1}/${files.size}: $name")
                 progress("Preparing tracks", i.toLong(), files.size.toLong())
-                sources += if (name.endsWith(".wav", ignoreCase = true)) {
-                    WavSource(name, contentResolver.openInputStream(uri)!!.buffered(1 shl 20))
-                } else {
-                    AudioDecoder.decodeToCdPcm(this@MainActivity, uri, name, File(cacheDir, "track$i.pcm"), cancel::get)
-                }
+                val wav = if (name.endsWith(".wav", ignoreCase = true)) {
+                    try { WavSource(name, contentResolver.openInputStream(uri)!!.buffered(1 shl 20)) } catch (e: java.io.IOException) { null }
+                } else null
+                // anything else (or a WAV that isn't CD format) is decoded, resampled and mixed to stereo
+                sources += wav ?: AudioDecoder.decodeToCdPcm(this@MainActivity, uri, name, File(cacheDir, "track$i.pcm"), cancel::get)
             }
             val totalSec = sources.sumOf { it.totalBytes } / (44_100L * 4)
             log("Total length %d:%02d".format(totalSec / 60, totalSec % 60))
@@ -719,12 +1098,15 @@ class MainActivity : Activity(), RipListener {
         private const val ACTION_USB_PERMISSION = "com.hatdagger.discdroid.USB_PERMISSION"
         private const val REQ_FOLDER = 1
         private const val REQ_ISO = 2
-        private const val REQ_AUDIO = 3
+        private const val REQ_SONGS = 3
         private const val KEY_FOLDER = "outputFolder"
         private const val KEY_LAST_DRIVE = "lastDrive"
         private const val KEY_FLAC = "flac"
         private const val KEY_ONLINE = "online"
         private const val KEY_SIMULATE = "simulate"
         private const val KEY_VERIFY = "verify"
+        private const val KEY_GAPLESS = "gapless"
+        private const val KEY_TAB = "tab"
+        private const val KEY_BURN_LIST = "burnList"
     }
 }

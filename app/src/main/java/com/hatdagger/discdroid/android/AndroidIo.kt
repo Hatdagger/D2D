@@ -6,10 +6,14 @@ import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
+import android.media.MediaMetadataRetriever
 import android.provider.OpenableColumns
+import android.util.Log
 import com.hatdagger.discdroid.core.CancelledException
 import com.hatdagger.discdroid.core.MusicBrainz
+import com.hatdagger.discdroid.core.PcmConverter
 import com.hatdagger.discdroid.core.PcmSource
+import com.hatdagger.discdroid.core.Song
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -53,6 +57,25 @@ object Files {
         }
         return name to size
     }
+
+    /** Fills in title, artist, track number and length from the file's tags (music or video). */
+    fun readTags(context: Context, song: Song) {
+        val r = MediaMetadataRetriever()
+        try {
+            r.setDataSource(context, Uri.parse(song.key))
+            r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)?.let { song.title = it }
+            (r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST)
+                ?: r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUMARTIST))?.let { song.artist = it }
+            r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CD_TRACK_NUMBER)
+                ?.substringBefore('/')?.trim()?.toIntOrNull()?.let { song.trackNumber = it }
+            r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()?.let { song.durationMs = it }
+            song.isVideo = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO) == "yes"
+        } catch (_: Exception) {
+            // unreadable tags: keep the file name
+        } finally {
+            try { r.release() } catch (_: Exception) {}
+        }
+    }
 }
 
 /** Raw 16-bit stereo 44.1 kHz PCM stored in a temp file. */
@@ -64,8 +87,10 @@ class RawPcmFile(override val name: String, private val file: File) : PcmSource 
 }
 
 /**
- * Decodes any audio file Android understands (FLAC, MP3, AAC/M4A, OGG, WAV…) to CD-format PCM
- * in a temp file, so burning is never slowed down by decoding.
+ * Decodes the audio of any file Android understands to CD-format PCM in a temp file, so burning
+ * is never slowed down by decoding. Works for music (FLAC, MP3, AAC/M4A, OGG, Opus, WAV…) and for
+ * the soundtrack of videos (MP4, WebM, MKV, 3GP). Other sample rates are resampled to 44.1 kHz and
+ * surround sound is mixed down to stereo.
  */
 object AudioDecoder {
     fun decodeToCdPcm(context: Context, uri: Uri, name: String, out: File, isCancelled: () -> Boolean): RawPcmFile {
@@ -75,14 +100,16 @@ object AudioDecoder {
             ex.setDataSource(context, uri, null)
             val track = (0 until ex.trackCount).firstOrNull {
                 ex.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
-            } ?: throw IOException("$name has no audio")
+            } ?: throw IOException("$name has no sound track")
             ex.selectTrack(track)
             val fmt = ex.getTrackFormat(track)
             val mime = fmt.getString(MediaFormat.KEY_MIME)!!
             var rate = fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
             var channels = fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
             var encoding = AndroidAudioFormat.ENCODING_PCM_16BIT
-            val c = MediaCodec.createDecoderByType(mime)
+            val c = try { MediaCodec.createDecoderByType(mime) } catch (e: Exception) {
+                throw IOException("$name uses a sound format this tablet can't decode ($mime)")
+            }
             codec = c
             c.configure(fmt, null, null, 0)
             c.start()
@@ -90,8 +117,18 @@ object AudioDecoder {
             var inputDone = false
             var outputDone = false
             var scratch = ByteArray(0)
-            val pcmOut = ByteArray(1 shl 16)
             BufferedOutputStream(FileOutputStream(out), 1 shl 20).use { os ->
+                var conv: PcmConverter? = null
+                fun converter(): PcmConverter {
+                    val cur = conv
+                    if (cur != null) return cur
+                    if (rate != 44_100 || channels > 2) {
+                        val what = if (channels > 2) "$channels-channel sound" else "sound"
+                        Log.i("D2D", "$name: converting $what at $rate Hz to CD audio")
+                    }
+                    return PcmConverter(rate, channels, encoding == AndroidAudioFormat.ENCODING_PCM_FLOAT) { b, n -> os.write(b, 0, n) }
+                        .also { conv = it }
+                }
                 while (!outputDone) {
                     if (isCancelled()) throw CancelledException()
                     if (!inputDone) {
@@ -111,24 +148,29 @@ object AudioDecoder {
                     val o = c.dequeueOutputBuffer(info, 10_000)
                     if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                         val f = c.outputFormat
-                        rate = f.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-                        channels = f.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                        if (f.containsKey(MediaFormat.KEY_PCM_ENCODING)) encoding = f.getInteger(MediaFormat.KEY_PCM_ENCODING)
-                    } else if (o >= 0) {
-                        if (rate != 44_100) {
-                            throw IOException("$name is $rate Hz. Audio CDs need 44,100 Hz files; resampling isn't supported yet.")
+                        val newRate = f.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                        val newChannels = f.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                        val newEnc = if (f.containsKey(MediaFormat.KEY_PCM_ENCODING)) f.getInteger(MediaFormat.KEY_PCM_ENCODING) else AndroidAudioFormat.ENCODING_PCM_16BIT
+                        if (newRate != rate || newChannels != channels || newEnc != encoding) {
+                            conv?.finish(); conv = null
+                            rate = newRate; channels = newChannels; encoding = newEnc
                         }
-                        val buf = c.getOutputBuffer(o)!!
-                        buf.position(info.offset)
-                        buf.limit(info.offset + info.size)
-                        if (scratch.size < info.size) scratch = ByteArray(info.size)
-                        buf.get(scratch, 0, info.size)
-                        writeCdPcm(scratch, info.size, channels, encoding, pcmOut, os)
+                    } else if (o >= 0) {
+                        if (info.size > 0) {
+                            val buf = c.getOutputBuffer(o)!!
+                            buf.position(info.offset)
+                            buf.limit(info.offset + info.size)
+                            if (scratch.size < info.size) scratch = ByteArray(info.size)
+                            buf.get(scratch, 0, info.size)
+                            converter().feed(scratch, info.size)
+                        }
                         c.releaseOutputBuffer(o, false)
                         if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outputDone = true
                     }
                 }
+                conv?.finish()
             }
+            if (out.length() == 0L) throw IOException("$name has no sound to burn")
             return RawPcmFile(name, out)
         } catch (e: Exception) {
             out.delete()
@@ -139,30 +181,4 @@ object AudioDecoder {
             ex.release()
         }
     }
-
-    /** Converts decoder output (16-bit or float, any channel count) to 16-bit stereo. */
-    private fun writeCdPcm(src: ByteArray, len: Int, channels: Int, encoding: Int, tmp: ByteArray, os: java.io.OutputStream) {
-        val bytesPerSample = if (encoding == AndroidAudioFormat.ENCODING_PCM_FLOAT) 4 else 2
-        val frameBytes = bytesPerSample * channels
-        val frames = len / frameBytes
-        var o = 0
-        for (f in 0 until frames) {
-            val base = f * frameBytes
-            val l = sample(src, base, encoding)
-            val r = if (channels >= 2) sample(src, base + bytesPerSample, encoding) else l
-            tmp[o++] = l.toByte(); tmp[o++] = (l shr 8).toByte()
-            tmp[o++] = r.toByte(); tmp[o++] = (r shr 8).toByte()
-            if (o == tmp.size) { os.write(tmp, 0, o); o = 0 }
-        }
-        if (o > 0) os.write(tmp, 0, o)
-    }
-
-    private fun sample(b: ByteArray, i: Int, encoding: Int): Int =
-        if (encoding == AndroidAudioFormat.ENCODING_PCM_FLOAT) {
-            val bits = (b[i].toInt() and 0xFF) or ((b[i + 1].toInt() and 0xFF) shl 8) or
-                ((b[i + 2].toInt() and 0xFF) shl 16) or (b[i + 3].toInt() shl 24)
-            (java.lang.Float.intBitsToFloat(bits) * 32767f).toInt().coerceIn(-32768, 32767)
-        } else {
-            (b[i].toInt() and 0xFF) or (b[i + 1].toInt() shl 8)
-        }
 }

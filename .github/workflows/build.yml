@@ -27,9 +27,9 @@ jobs:
         run: gradle assembleRelease --stacktrace
 
       - name: Rename APK
-        run: cp app/build/outputs/apk/release/app-release.apk DiscDroid.apk
+        run: cp app/build/outputs/apk/release/app-release.apk D2D-Disc2Android.apk
 
       - uses: actions/upload-artifact@v4
         with:
-          name: DiscDroid-apk
-          path: DiscDroid.apk
+          name: D2D-Disc2Android.apk
+          path: D2D-Disc2Android.apk

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Offer to open DiscDroid when a USB mass-storage device (class 8) is plugged in. -->
+<!-- Offer to open D2D Disc2Android when a USB mass-storage device (class 8) is plugged in. -->
 <resources>
     <usb-device class="8" />
 </resources>

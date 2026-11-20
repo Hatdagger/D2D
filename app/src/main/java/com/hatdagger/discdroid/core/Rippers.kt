@@ -101,7 +101,7 @@ private class ChunkReader(
     }
 
     private fun copyProtected() = IOException(
-        "This disc is copy-protected (encrypted sectors). DiscDroid only copies discs without copy protection.",
+        "This disc is copy-protected (encrypted sectors). D2D only copies discs without copy protection.",
     )
 }
 

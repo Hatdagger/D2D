@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "DiscDroid"
+rootProject.name = "D2D"
 include(":app")
