@@ -321,6 +321,27 @@ class Burner(private val drive: Drive, private val listener: RipListener, privat
 
     // ------------------------------------------------------------------ audio CD burning
 
+    /**
+     * Quick checks before any slow track preparation: a CD is in the drive, it's a blank CD-R/RW,
+     * and (if [estimatedSeconds] is known) the music should fit. Throws with a plain message if not.
+     */
+    fun checkAudioDisc(opts: BurnOptions, trackCount: Int, estimatedSeconds: Long): DiscStatus {
+        if (trackCount !in 1..99) throw IOException("An audio CD holds 1 to 99 tracks (your list has $trackCount).")
+        drive.waitReady(isCancelled = isCancelled) || throw IOException("No disc in the drive. Put a blank CD-R in and try again.")
+        val st = discStatus()
+        listener.log("Disc: ${st.describe()}")
+        if (!st.kind.isCd) throw IOException("Audio CDs need a CD-R or CD-RW (this is ${Profiles.name(st.profile)}).")
+        if (!st.isBlank) throw IOException(if (st.erasable) "The disc isn't blank. Tap Erase first." else "The disc isn't blank. Use a new CD-R.")
+        if (estimatedSeconds > 0) {
+            val overhead = if (opts.gapless) 0L else trackCount * TAO_OVERHEAD
+            val needed = estimatedSeconds * 75 + overhead
+            if (needed > st.freeSectors) throw IOException("Your list is about %d:%02d but this disc holds %d:%02d. Remove some songs.".format(
+                needed / 75 / 60, needed / 75 % 60, st.freeSectors / 75 / 60, st.freeSectors / 75 % 60))
+        }
+        listener.log("Disc OK: blank, room for about %d:%02d.".format(st.freeSectors / 75 / 60, st.freeSectors / 75 % 60))
+        return st
+    }
+
     fun burnAudio(tracks: List<PcmSource>, opts: BurnOptions) {
         require(tracks.isNotEmpty() && tracks.size <= 99) { "An audio CD holds 1 to 99 tracks." }
         drive.waitReady(isCancelled = isCancelled) || throw IOException("No disc in the drive.")

@@ -270,6 +270,17 @@ class BurnerTest {
         assertTrue(rec.testWrite); assertTrue(rec.sectors.isEmpty()); assertEquals(0, rec.state)
     }
 
+    @Test fun earlyAudioCheckCatchesUsedDiscAndTooLong() {
+        val b = { rec: FakeRecorder -> Burner(Drive(rec), NoopListener) { false } }
+        try { b(FakeRecorder(state = 2)).checkAudioDisc(opts, 10, 2400); fail() }
+        catch (e: IOException) { assertTrue(e.message!!, e.message!!.contains("isn't blank")) }
+        try { b(FakeRecorder()).checkAudioDisc(opts, 20, 90 * 60); fail() }
+        catch (e: IOException) { assertTrue(e.message!!, e.message!!.contains("Remove some songs")) }
+        try { b(FakeRecorder(profile = 0x11)).checkAudioDisc(opts, 3, 600); fail() }
+        catch (e: IOException) { assertTrue(e.message!!, e.message!!.contains("CD-R")) }
+        assertTrue(b(FakeRecorder()).checkAudioDisc(opts, 15, 70 * 60).isBlank)
+    }
+
     @Test fun audioNeedsCd() {
         val rec = FakeRecorder(profile = 0x11)
         try {

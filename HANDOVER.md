@@ -36,6 +36,7 @@ DVD burner with built-in hub and SD/TF reader. Nothing tested on real hardware y
   `Drive.readRaw`. "Copy disc" button auto-picks: CD with data first + (Mode 2 or >1 track) →
   BIN/CUE folder (.bin, .cue, copy-log.txt); else ISO. MusicBrainz skipped when track 1 is data.
 - Copy log button in the hinge copies RIP + BURN logs to clipboard.
+- Audio burn: `Burner.checkAudioDisc` (CD present, blank CD-R/RW, estimated length fits) now runs BEFORE decoding tracks (user hit a non-blank error only after long preparation).
 - Hardware results so far: audio TAO burn OK, disc playback OK. PS1 (Japanese) ISO copy failed
   before v0.4 (no log). Second burn (gapless, MP4s) produced a disc with an unrelated album:
   suspected non-blank/reused disc (burner refuses non-blank) — awaiting user's retest + log.

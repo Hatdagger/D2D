@@ -1100,12 +1100,15 @@ class MainActivity : Activity(), RipListener {
         val secs = burnList.sumOf { it.durationMs } / 1000
         val mode = if (opts.gapless) "with no gaps between tracks" else "with 2-second gaps between tracks"
         val warn = if (secs > Playlists.CD_SECONDS) "\n\nWarning: this is ${Playlists.clock(secs)}, longer than an 80-minute CD." else ""
-        val go = { burnAudio(files, opts) }
+        val go = { burnAudio(files, opts, secs) }
         if (opts.simulate) go()
         else confirm("Burn audio CD?", "Burn these ${files.size} tracks $mode? This can't be undone.$warn\n\n$list", "Burn", go)
     }
 
-    private fun burnAudio(files: List<Pair<Uri, String>>, opts: BurnOptions) = job("Audio CD", burnLog) { d ->
+    private fun burnAudio(files: List<Pair<Uri, String>>, opts: BurnOptions, estimatedSeconds: Long) = job("Audio CD", burnLog) { d ->
+        // Check the disc first, so a wrong or used disc is caught before minutes of track preparation.
+        log("Checking the disc…")
+        Burner(d, this@MainActivity, cancel::get).checkAudioDisc(opts, files.size, estimatedSeconds)
         val sources = mutableListOf<PcmSource>()
         val cacheDir = File(cacheDir, "burn").apply { mkdirs() }
         try {
