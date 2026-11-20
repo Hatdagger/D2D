@@ -34,6 +34,9 @@ import android.widget.TextView
 import com.hatdagger.discdroid.core.AlbumInfo
 import com.hatdagger.discdroid.core.AudioFormat
 import com.hatdagger.discdroid.core.AudioRipper
+import com.hatdagger.discdroid.core.TrackMode
+import com.hatdagger.discdroid.core.DiscImage
+import com.hatdagger.discdroid.core.BinRipper
 import com.hatdagger.discdroid.core.BurnOptions
 import com.hatdagger.discdroid.core.Burner
 import com.hatdagger.discdroid.core.CancelledException
@@ -179,6 +182,14 @@ class MainActivity : Activity(), RipListener {
 
     private fun dp(v: Int) = ui2.dp(v)
 
+    /** Puts both logs on the clipboard so they can be pasted into a message. */
+    private fun copyLogs() {
+        val text = "D2D Disc2Android log\n\n=== RIP ===\n${ripLog.text.text}\n=== BURN ===\n${burnLog.text.text}"
+        val cm = getSystemService(android.content.ClipboardManager::class.java)
+        cm.setPrimaryClip(android.content.ClipData.newPlainText("D2D log", text))
+        toastLine("Log copied. Paste it anywhere.")
+    }
+
     /** A scrolling log area belonging to one half of the screen. */
     private inner class LogPane {
         val text = TextView(this@MainActivity).apply {
@@ -268,7 +279,7 @@ class MainActivity : Activity(), RipListener {
             addView(ui2.row(
                 btn("Read disc", Palette.BLUE, action = ::readDisc),
                 btn("Rip audio CD", Palette.BLUE, Ui.Style.FILLED, action = ::ripAudio),
-                btn("Copy disc (ISO)", Palette.BLUE, action = ::ripIso),
+                btn("Copy disc", Palette.BLUE, action = ::ripIso),
             ))
             addView(flow(optFlac, optOnline))
             addView(ripLog.scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f).apply { topMargin = dp(4) })
@@ -287,6 +298,8 @@ class MainActivity : Activity(), RipListener {
         progressCol.addView(progressText)
         hinge.addView(progressCol, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         btnCancel = ui2.button("Cancel", Palette.AMBER, Ui.Style.OUTLINE) { cancel.set(true); log("Cancelling…") }.apply { isEnabled = false; alpha = 0.4f }
+        hinge.addView(ui2.button("Copy log", Palette.AMBER, Ui.Style.OUTLINE) { copyLogs() },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginStart = dp(12) })
         hinge.addView(btnCancel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginStart = dp(12) })
         root.addView(hinge)
 
@@ -866,7 +879,8 @@ class MainActivity : Activity(), RipListener {
         val t = try { d.readToc() } catch (e: Exception) { log("No track list (blank disc?): ${e.message}"); null }
         toc = t
         if (t == null) return@job
-        if (t.audioTracks.isNotEmpty()) album = lookUpNames(d, t)
+        // game discs (data first, music after) aren't music albums: skip the name lookup
+        if (t.tracks.first().isAudio) album = lookUpNames(d, t)
         val a = album
         if (a != null) log("${a.source}: ${a.artist ?: "?"} — ${a.title ?: "?"}${a.date?.let { " ($it)" } ?: ""}")
         for (tr in t.tracks) {
@@ -875,7 +889,7 @@ class MainActivity : Activity(), RipListener {
             log("  %2d  %s  %s%s".format(tr.number, kind, if (tr.isData) "%,d sectors".format(tr.lengthSectors) else tr.durationText(), title))
         }
         if (t.audioTracks.isNotEmpty()) log("Ready: tap \"Rip audio CD\", or play it in the Player tab (Disc).")
-        if (t.dataTracks.isNotEmpty()) log("Ready: tap \"Copy disc (ISO)\" for an ISO image.")
+        if (t.dataTracks.isNotEmpty()) log("Ready: tap \"Copy disc\" to save it as an image file (ISO, or BIN/CUE for game discs).")
     }
 
     /** MusicBrainz first (if enabled), then CD-TEXT. */
@@ -977,11 +991,19 @@ class MainActivity : Activity(), RipListener {
             val start: Long
             val sectors: Long
             val dataTrack = t?.dataTracks?.firstOrNull()
+            if (!Profiles.isDvd(profile) && t != null && dataTrack != null) {
+                val bin = BinRipper(d, this@MainActivity, cancel::get)
+                val modes = bin.detectModes(t)
+                if (DiscImage.needsBinCue(t, modes)) {
+                    copyBinCue(d, t, modes, bin, ripper, out)
+                    return@job
+                }
+            }
             if (!Profiles.isDvd(profile) && dataTrack != null) {
                 start = dataTrack.startLba
                 sectors = dataTrack.lengthSectors
             } else if (!Profiles.isDvd(profile) && t != null && t.dataTracks.isEmpty()) {
-                log("This is an audio CD with no data track — use \"Rip audio CD\" instead.")
+                log("This is an audio CD with no data track. Use \"Rip audio CD\" instead.")
                 return@job
             } else {
                 start = 0
@@ -1003,6 +1025,38 @@ class MainActivity : Activity(), RipListener {
                 throw e
             }
         }
+    }
+
+    /** Game discs (PS1, Saturn, Sega CD, Neo Geo CD…) and other mixed CDs: raw BIN + CUE in a folder. */
+    private fun copyBinCue(d: Drive, t: Toc, modes: Map<Int, TrackMode>, bin: BinRipper, iso: IsoRipper, out: OutputFolder) {
+        val first = t.tracks.first()
+        val vol = if (modes[first.number] != null) iso.readVolume(first.startLba) else null
+        val stamp = SimpleDateFormat("yyyy-MM-dd HHmm", Locale.US).format(Date())
+        val name = Names.safe(vol?.label ?: "", "Game disc $stamp")
+        val audio = t.audioTracks.size
+        val kind = t.dataTracks.joinToString { (modes[it.number] ?: TrackMode.MODE1).cue }
+        log("Game/mixed disc: data track $kind${if (audio > 0) " + $audio music track${if (audio == 1) "" else "s"}" else ""}.")
+        val sectors = t.tracks.sumOf { it.lengthSectors }
+        log("Copying all %d tracks (%,d sectors, %.1f MB) as BIN/CUE to folder \"%s\"…".format(t.tracks.size, sectors, sectors * 2352 / 1_048_576.0, name))
+        val folder = out.createFolder(out.root(), name)
+        val binName = "$name.bin"
+        val binDoc = out.createFile(folder, "application/octet-stream", binName)
+        resetProgress()
+        val stats = try {
+            BufferedOutputStream(out.open(binDoc), 1 shl 20).use { s -> bin.rip(t, s) }
+        } catch (e: Exception) {
+            out.delete(binDoc); out.delete(folder)
+            throw e
+        }
+        out.open(out.createFile(folder, "application/octet-stream", "$name.cue")).use {
+            it.write(DiscImage.cueSheet(t, modes, binName).toByteArray())
+        }
+        val report = "D2D Disc2Android disc copy log\nDrive: ${d.description}\nDisc: $name\nTracks:\n" +
+            t.tracks.joinToString("") { "  %02d  %-10s  start %d, %,d sectors\n".format(it.number, if (it.isAudio) "AUDIO" else (modes[it.number] ?: TrackMode.MODE1).cue, it.startLba, it.lengthSectors) } +
+            "Result: ${stats.summary()}\n"
+        out.open(out.createFile(folder, "text/plain", "copy-log.txt")).use { it.write(report.toByteArray()) }
+        log("Disc copy finished: ${stats.summary()}")
+        log("Saved $name.bin + $name.cue. Open the .cue file in an emulator (DuckStation, RetroArch…).")
     }
 
     // ---------------------------------------------------------------- burning

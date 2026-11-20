@@ -48,7 +48,7 @@ class RipStats(val sectors: Long, val badSectors: Long, val retriedChunks: Int, 
  * Shared chunked reader with retries. On a failed chunk it re-reads sector by sector;
  * a sector that still fails after [sectorRetries] tries is replaced with zeros.
  */
-private class ChunkReader(
+internal class ChunkReader(
     private val sectorSize: Int,
     private val chunkSectors: Int,
     private val sectorRetries: Int,

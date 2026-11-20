@@ -107,6 +107,23 @@ class Drive(private val transport: ScsiTransport) : AutoCloseable {
         if (n != len) throw IOException("READ CD returned $n of $len bytes")
     }
 
+    /**
+     * READ CD for any sector type: [count] full 2352-byte sectors (sync, header, data, EDC/ECC)
+     * into [buf]. Used for game discs (PS1 etc.) where the plain 2048-byte read loses data.
+     */
+    fun readRaw(lba: Long, count: Int, buf: ByteArray) {
+        val len = count * AUDIO_SECTOR
+        require(buf.size >= len)
+        val cdb = ByteArray(12)
+        cdb[0] = 0xBE.toByte()
+        cdb[1] = 0x00 // any sector type
+        cdb.putBe32(2, lba)
+        cdb[6] = (count shr 16).toByte(); cdb[7] = (count shr 8).toByte(); cdb[8] = count.toByte()
+        cdb[9] = 0xF8.toByte() // sync + all headers + user data + EDC/ECC
+        val n = run("READ CD (raw)", cdb, Direction.IN, buf, len, 30_000)
+        if (n != len) throw IOException("READ CD returned $n of $len bytes")
+    }
+
     /** READ(10): [count] 2048-byte data sectors into [buf]. */
     fun readData(lba: Long, count: Int, buf: ByteArray) {
         val len = count * DATA_SECTOR

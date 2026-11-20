@@ -16,7 +16,11 @@ tabs, **Player** (green) and **Burn** (red). The progress bar and Cancel button 
 - Detects the disc drive (skips card readers/hubs in combo drives)
 - Reads the track list, disc type, and album/track names (MusicBrainz online, or CD-TEXT)
 - Rips audio CDs to **FLAC** (lossless, tagged) or WAV, with retries, cover art and a rip log
-- Copies data CDs/DVDs to an ISO image
+- **Copy disc** saves data CDs/DVDs as an ISO image, and game discs as **BIN/CUE**
+  (PlayStation 1, Sega Saturn, Sega CD, Neo Geo CD, PC Engine CD, CD-based PS2 games and any CD
+  that mixes data and music). It picks the right format by itself. DVD-based PS2 games come out
+  as an ISO.
+- **Copy log** button (next to Cancel) copies both logs so you can paste them into a message
 
 **Player**
 - **Burn list**: add music *or video* files, put them in order, and listen to them before burning
@@ -37,6 +41,9 @@ tabs, **Player** (green) and **Burn** (red). The progress bar and Cancel button 
   automatically: resampled to 44.1 kHz and mixed down to stereo.
 - **Test burn** mode runs the whole burn with the laser off (CD-R/RW and DVD-R/RW)
 - Erases CD-RW / DVD-RW and formats DVD+RW
+
+**Not possible with a normal drive:** GameCube/Wii, original Xbox and Dreamcast (GD-ROM)
+game discs. Their drives use special disc formats or locks that ordinary DVD drives can't read.
 
 **Not yet:** AccurateRip checks, playback that keeps going when you leave the app, Blu-ray.
 

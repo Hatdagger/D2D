@@ -29,6 +29,18 @@ DVD burner with built-in hub and SD/TF reader. Nothing tested on real hardware y
   compiler + JUnit from `/opt/gradle-8.14.3/lib`; Android code is checked by the GitHub build
   (public API: `api.github.com/repos/Hatdagger/D2D/actions/runs`).
 
+## v0.4 (BIN/CUE + Copy log)
+- `core/DiscImage.kt`: `DiscImage` (sector mode from raw header, `needsBinCue`, cue sheet with
+  INDEX 00 = 150-sector pregap for audio after data), `BinRipper` (READ CD raw 0xBE type any
+  flags 0xF8 for data tracks, falls back to CD-DA read; audio tracks via readAudio; one .bin).
+  `Drive.readRaw`. "Copy disc" button auto-picks: CD with data first + (Mode 2 or >1 track) →
+  BIN/CUE folder (.bin, .cue, copy-log.txt); else ISO. MusicBrainz skipped when track 1 is data.
+- Copy log button in the hinge copies RIP + BURN logs to clipboard.
+- Hardware results so far: audio TAO burn OK, disc playback OK. PS1 (Japanese) ISO copy failed
+  before v0.4 (no log). Second burn (gapless, MP4s) produced a disc with an unrelated album:
+  suspected non-blank/reused disc (burner refuses non-blank) — awaiting user's retest + log.
+- Not possible on stock drives: GameCube/Wii, Xbox, Dreamcast GD-ROM.
+
 ## Next steps
 1. When the drive arrives: Connect, Read disc, play a CD in Player → Disc, rip a CD; Test burn
    (normal and "No gaps"); real burn on a CD-RW. Collect log text for any failure.
